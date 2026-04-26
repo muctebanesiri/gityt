@@ -1,4 +1,4 @@
-name: Download Latest 5 Videos from Channel
+name: Download Latest 5 Videos via Invidious (No Cookies)
 
 on:
   workflow_dispatch:
@@ -7,6 +7,10 @@ on:
         description: 'YouTube channel URL (e.g., https://www.youtube.com/@lukesmithxyz)'
         required: true
         default: 'https://www.youtube.com/@lukesmithxyz'
+      invidious_instance:
+        description: 'Invidious instance (leave default for auto-select)'
+        required: false
+        default: ''
 
 jobs:
   download:
@@ -26,59 +30,53 @@ jobs:
           sudo apt-get install -y ffmpeg
           pip install --upgrade yt-dlp
 
-      - name: Setup Node.js for EJS
-        uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-
-      - name: Setup YouTube Cookies (Secret)
+      - name: Set Invidious instance (or auto-select)
         run: |
-          if [ -n "${{ secrets.YOUTUBE_COOKIES }}" ]; then
-            echo "${{ secrets.YOUTUBE_COOKIES }}" > cookies.txt
+          if [ -n "${{ github.event.inputs.invidious_instance }}" ]; then
+            echo "instance=${{ github.event.inputs.invidious_instance }}" >> $GITHUB_ENV
           else
-            echo "⚠️ No cookies secret found. Public videos only."
+            # Use a known working Invidious instance (you can change this)
+            echo "instance=https://invidious.io" >> $GITHUB_ENV
           fi
 
-      - name: Get latest 5 video URLs from channel
-        id: get_videos
+      - name: Get latest 5 video URLs from channel (via Invidious)
         run: |
           CHANNEL="${{ github.event.inputs.channel_url }}"
-          echo "Fetching latest 5 videos from: $CHANNEL"
-          yt-dlp --flat-playlist --print url --playlist-end 5 "$CHANNEL" > video_urls.txt
-          echo "Found $(wc -l < video_urls.txt) videos"
+          INSTANCE="${{ env.instance }}"
+          echo "Using Invidious instance: $INSTANCE"
+          # yt-dlp with invidious extractor – no cookies, no IP ban
+          yt-dlp --extractor-args "invidious:instance=$INSTANCE" \
+                 --flat-playlist \
+                 --print url \
+                 --playlist-end 5 \
+                 "$CHANNEL" > video_urls.txt
+          cat video_urls.txt
 
-      - name: Download videos with improved anti-bot measures
+      - name: Download videos (360p) via Invidious
         run: |
           mkdir -p downloads
           touch downloaded.txt
-
+          INSTANCE="${{ env.instance }}"
           while IFS= read -r url; do
             VIDEO_ID=$(echo "$url" | grep -oP '(?<=v=)[^&]+')
             if grep -Fxq "$url" downloaded.txt || grep -Fxq "$VIDEO_ID" downloaded.txt; then
               echo "⏭️ Already downloaded: $url"
               continue
             fi
-
-            echo "⬇️ Downloading: $url"
-            CMD="yt-dlp --force-ipv4 --no-playlist --retries 10"
-            [ -f cookies.txt ] && CMD="$CMD --cookies cookies.txt"
-
-            $CMD \
-              --extractor-args "youtube:player_client=android,web" \
-              --format "bestvideo[height<=360][ext=mp4]+bestaudio[ext=m4a]/best[height<=360][ext=mp4]/best[ext=mp4]/best" \
-              --merge-output-format mp4 \
-              --output "downloads/%(title)s.%(ext)s" \
-              "$url"
-
-            NEW_FILE=$(find downloads -type f -name "*.mp4" -newer downloaded.txt | head -1)
+            echo "⬇️ Downloading via Invidious: $url"
+            yt-dlp --extractor-args "invidious:instance=$INSTANCE" \
+                   --no-playlist \
+                   --format "bestvideo[height<=360][ext=mp4]+bestaudio[ext=m4a]/best[height<=360][ext=mp4]/best[ext=mp4]/best" \
+                   --merge-output-format mp4 \
+                   --retries 5 \
+                   --output "downloads/%(title)s.%(ext)s" \
+                   "$url"
+            NEW_FILE=$(find downloads -type f -name "*.mp4" -newer downloaded.txt 2>/dev/null | head -1)
             if [ -n "$NEW_FILE" ]; then
               echo "$url" >> downloaded.txt
               echo "✅ Downloaded: $(basename "$NEW_FILE")"
-            else
-              echo "⚠️ No file downloaded for $url - may require cookies."
             fi
           done < video_urls.txt
-
           if [ ! -s downloaded.txt ]; then rm -f downloaded.txt; fi
 
       - name: Split large files (>90 MB)
@@ -90,22 +88,21 @@ jobs:
               LIMIT=$((90 * 1024 * 1024))
               BASENAME=$(basename "$file")
               if [ "$SIZE" -gt "$LIMIT" ]; then
-                echo "✂️ $BASENAME is $(( SIZE / 1024 / 1024 )) MB – splitting into 90 MB zip chunks"
                 zip -s 90m -r "downloads/${BASENAME}.zip" "$file"
                 rm -f "$file"
               fi
             done
           fi
 
-      - name: Commit and push new videos
+      - name: Commit and push
         run: |
           if git status --porcelain | grep -q "downloads/"; then
             git config user.name "github-actions"
             git config user.email "github-actions@github.com"
             git add downloads/ downloaded.txt 2>/dev/null || git add downloads/
-            git commit -m "Add latest 5 videos from channel [skip ci]"
+            git commit -m "Add videos via Invidious [skip ci]" || echo "Nothing to commit"
             git pull --rebase origin ${{ github.ref_name }} --autostash || true
             git push origin HEAD:${{ github.ref_name }}
           else
-            echo "No new videos to commit"
+            echo "No new videos"
           fi

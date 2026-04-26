@@ -1,17 +1,13 @@
-name: Download Latest 5 Videos via Invidious (No Cookies)
-
+name: Download YouTube Videos via Invidious (No Cookies)
 on:
   workflow_dispatch:
     inputs:
       channel_url:
-        description: 'YouTube channel URL (e.g., https://www.youtube.com/@lukesmithxyz)'
+        description: 'YouTube channel URL'
         required: true
-        default: 'https://www.youtube.com/@lukesmithxyz'
       invidious_instance:
-        description: 'Invidious instance (leave default for auto-select)'
-        required: false
-        default: ''
-
+        description: 'Invidious instance (e.g., https://invidious.example.com)'
+        required: true
 jobs:
   download:
     runs-on: ubuntu-latest
@@ -20,89 +16,17 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          fetch-depth: 0
-
-      - name: Install dependencies
+      - name: Install yt-dlp
+        run: pip install yt-dlp
+      - name: Download 5 latest videos
         run: |
-          sudo apt-get update
-          sudo apt-get install -y ffmpeg
-          pip install --upgrade yt-dlp
-
-      - name: Set Invidious instance (or auto-select)
-        run: |
-          if [ -n "${{ github.event.inputs.invidious_instance }}" ]; then
-            echo "instance=${{ github.event.inputs.invidious_instance }}" >> $GITHUB_ENV
-          else
-            # Use a known working Invidious instance (you can change this)
-            echo "instance=https://invidious.io" >> $GITHUB_ENV
-          fi
-
-      - name: Get latest 5 video URLs from channel (via Invidious)
-        run: |
-          CHANNEL="${{ github.event.inputs.channel_url }}"
-          INSTANCE="${{ env.instance }}"
-          echo "Using Invidious instance: $INSTANCE"
-          # yt-dlp with invidious extractor – no cookies, no IP ban
-          yt-dlp --extractor-args "invidious:instance=$INSTANCE" \
-                 --flat-playlist \
-                 --print url \
+          yt-dlp --ies invidious \
+                 --extractor-args "invidious:instance=${{ github.event.inputs.invidious_instance }}" \
+                 --no-playlist \
                  --playlist-end 5 \
-                 "$CHANNEL" > video_urls.txt
-          cat video_urls.txt
-
-      - name: Download videos (360p) via Invidious
-        run: |
-          mkdir -p downloads
-          touch downloaded.txt
-          INSTANCE="${{ env.instance }}"
-          while IFS= read -r url; do
-            VIDEO_ID=$(echo "$url" | grep -oP '(?<=v=)[^&]+')
-            if grep -Fxq "$url" downloaded.txt || grep -Fxq "$VIDEO_ID" downloaded.txt; then
-              echo "⏭️ Already downloaded: $url"
-              continue
-            fi
-            echo "⬇️ Downloading via Invidious: $url"
-            yt-dlp --extractor-args "invidious:instance=$INSTANCE" \
-                   --no-playlist \
-                   --format "bestvideo[height<=360][ext=mp4]+bestaudio[ext=m4a]/best[height<=360][ext=mp4]/best[ext=mp4]/best" \
-                   --merge-output-format mp4 \
-                   --retries 5 \
-                   --output "downloads/%(title)s.%(ext)s" \
-                   "$url"
-            NEW_FILE=$(find downloads -type f -name "*.mp4" -newer downloaded.txt 2>/dev/null | head -1)
-            if [ -n "$NEW_FILE" ]; then
-              echo "$url" >> downloaded.txt
-              echo "✅ Downloaded: $(basename "$NEW_FILE")"
-            fi
-          done < video_urls.txt
-          if [ ! -s downloaded.txt ]; then rm -f downloaded.txt; fi
-
-      - name: Split large files (>90 MB)
-        run: |
-          if [ -d downloads ]; then
-            for file in downloads/*.mp4; do
-              [ -f "$file" ] || continue
-              SIZE=$(stat -c%s "$file")
-              LIMIT=$((90 * 1024 * 1024))
-              BASENAME=$(basename "$file")
-              if [ "$SIZE" -gt "$LIMIT" ]; then
-                zip -s 90m -r "downloads/${BASENAME}.zip" "$file"
-                rm -f "$file"
-              fi
-            done
-          fi
-
-      - name: Commit and push
-        run: |
-          if git status --porcelain | grep -q "downloads/"; then
-            git config user.name "github-actions"
-            git config user.email "github-actions@github.com"
-            git add downloads/ downloaded.txt 2>/dev/null || git add downloads/
-            git commit -m "Add videos via Invidious [skip ci]" || echo "Nothing to commit"
-            git pull --rebase origin ${{ github.ref_name }} --autostash || true
-            git push origin HEAD:${{ github.ref_name }}
-          else
-            echo "No new videos"
-          fi
+                 --format "bestvideo[height<=360][ext=mp4]+bestaudio[ext=m4a]/best[height<=360][ext=mp4]" \
+                 -o "downloads/%(title)s.%(ext)s" \
+                 "${{ github.event.inputs.channel_url }}"
+      - uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: "Add videos from channel"

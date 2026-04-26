@@ -1,0 +1,111 @@
+name: Download Latest 5 Videos from Channel
+
+on:
+  workflow_dispatch:
+    inputs:
+      channel_url:
+        description: 'YouTube channel URL (e.g., https://www.youtube.com/@lukesmithxyz)'
+        required: true
+        default: 'https://www.youtube.com/@lukesmithxyz'
+
+jobs:
+  download:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+          pip install --upgrade yt-dlp
+
+      - name: Setup Node.js for EJS
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Setup YouTube Cookies (Secret)
+        run: |
+          if [ -n "${{ secrets.YOUTUBE_COOKIES }}" ]; then
+            echo "${{ secrets.YOUTUBE_COOKIES }}" > cookies.txt
+          else
+            echo "⚠️ No cookies secret found. Public videos only."
+          fi
+
+      - name: Get latest 5 video URLs from channel
+        id: get_videos
+        run: |
+          CHANNEL="${{ github.event.inputs.channel_url }}"
+          echo "Fetching latest 5 videos from: $CHANNEL"
+          yt-dlp --flat-playlist --print url --playlist-end 5 "$CHANNEL" > video_urls.txt
+          echo "Found $(wc -l < video_urls.txt) videos"
+
+      - name: Download videos with improved anti-bot measures
+        run: |
+          mkdir -p downloads
+          touch downloaded.txt
+
+          while IFS= read -r url; do
+            VIDEO_ID=$(echo "$url" | grep -oP '(?<=v=)[^&]+')
+            if grep -Fxq "$url" downloaded.txt || grep -Fxq "$VIDEO_ID" downloaded.txt; then
+              echo "⏭️ Already downloaded: $url"
+              continue
+            fi
+
+            echo "⬇️ Downloading: $url"
+            CMD="yt-dlp --force-ipv4 --no-playlist --retries 10"
+            [ -f cookies.txt ] && CMD="$CMD --cookies cookies.txt"
+
+            $CMD \
+              --extractor-args "youtube:player_client=android,web" \
+              --format "bestvideo[height<=360][ext=mp4]+bestaudio[ext=m4a]/best[height<=360][ext=mp4]/best[ext=mp4]/best" \
+              --merge-output-format mp4 \
+              --output "downloads/%(title)s.%(ext)s" \
+              "$url"
+
+            NEW_FILE=$(find downloads -type f -name "*.mp4" -newer downloaded.txt | head -1)
+            if [ -n "$NEW_FILE" ]; then
+              echo "$url" >> downloaded.txt
+              echo "✅ Downloaded: $(basename "$NEW_FILE")"
+            else
+              echo "⚠️ No file downloaded for $url - may require cookies."
+            fi
+          done < video_urls.txt
+
+          if [ ! -s downloaded.txt ]; then rm -f downloaded.txt; fi
+
+      - name: Split large files (>90 MB)
+        run: |
+          if [ -d downloads ]; then
+            for file in downloads/*.mp4; do
+              [ -f "$file" ] || continue
+              SIZE=$(stat -c%s "$file")
+              LIMIT=$((90 * 1024 * 1024))
+              BASENAME=$(basename "$file")
+              if [ "$SIZE" -gt "$LIMIT" ]; then
+                echo "✂️ $BASENAME is $(( SIZE / 1024 / 1024 )) MB – splitting into 90 MB zip chunks"
+                zip -s 90m -r "downloads/${BASENAME}.zip" "$file"
+                rm -f "$file"
+              fi
+            done
+          fi
+
+      - name: Commit and push new videos
+        run: |
+          if git status --porcelain | grep -q "downloads/"; then
+            git config user.name "github-actions"
+            git config user.email "github-actions@github.com"
+            git add downloads/ downloaded.txt 2>/dev/null || git add downloads/
+            git commit -m "Add latest 5 videos from channel [skip ci]"
+            git pull --rebase origin ${{ github.ref_name }} --autostash || true
+            git push origin HEAD:${{ github.ref_name }}
+          else
+            echo "No new videos to commit"
+          fi
